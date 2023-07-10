@@ -1,0 +1,165 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables:
+        ENV_NAME: "dev"
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables:
+        ENV_NAME: "staging"
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        ENV_NAME: "prod"
+
+default:
+  image: alpine
+
+stages:
+  - ec2:validate
+  - ec2:plan
+  - ec2:apply
+  - ec2:destroy
+  - s3:validate
+  - s3:plan
+  - s3:apply
+  - s3:destroy
+
+.terraform:
+  variables:
+    TF_WORKING_DIRECTORY: ''
+  image:
+    name: hashicorp/terraform:light
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  before_script:
+    - export AWS_ACCESS_KEY=${AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - rm -rf $TF_WORKING_DIRECTORY/.terraform
+    - terraform --version
+    - export STATE_NAME="tf_state_${TF_WORKING_DIRECTORY//\//_}_${ENV_NAME}"          # Name of terraform state used in "terraform init"command
+    - export TF_ADDRESS="https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/terraform/state/${STATE_NAME}"
+    - echo "TF_ADDRESS is $TF_ADDRESS"
+    - export TF_CLI_ARGS_init="-backend-config='address=${TF_ADDRESS}' -backend-config='lock_address=${TF_ADDRESS}/lock'"
+    - export TF_CLI_ARGS_init="$TF_CLI_ARGS_init -backend-config='unlock_address=${TF_ADDRESS}/lock'"
+    - export TF_CLI_ARGS_init="$TF_CLI_ARGS_init -backend-config='username=${TF_USERNAME}' -backend-config='password=${TF_PASSWORD}'"
+    - export TF_CLI_ARGS_init="$TF_CLI_ARGS_init -backend-config='lock_method=POST' -backend-config='unlock_method=DELETE'"
+    - export TF_CLI_ARGS_init="$TF_CLI_ARGS_init -backend-config='retry_wait_min=5'"
+    - terraform -chdir=$TF_WORKING_DIRECTORY init
+
+##
+# ec2
+##
+ec2:validate:
+  stage: ec2:validate
+  environment: 
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/ec2
+  extends: .terraform_validate
+
+
+ec2:plan:
+  stage: ec2:plan
+  environment: 
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/ec2
+  extends: .terraform_plan
+  dependencies:
+    - ec2:validate
+
+ec2:apply:
+  stage: ec2:apply
+  environment: 
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/ec2
+  extends: .terraform_apply
+  dependencies:
+    - ec2:plan
+
+# To destroy infrastructure on cloud. It needs manual approval
+ec2:destroy:
+  stage: ec2:destroy
+  environment:
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/ec2
+  extends: .terraform_destroy
+  dependencies:
+    - ec2:plan
+    - ec2:apply
+  when: manual
+
+s3:validate:
+  stage: s3:validate
+  environment:
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/storage
+  extends: .terraform_validate
+
+
+s3:plan:
+  stage: s3:plan
+  environment:
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/storage
+  extends: .terraform_plan
+  dependencies:
+    - s3:validate
+
+s3:apply:
+  stage: s3:apply
+  environment:
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/storage
+  extends: .terraform_apply
+  dependencies:
+    - s3:plan
+
+# To destroy infrastructure on cloud. It needs manual approval
+s3:destroy:
+  stage: s3:destroy
+  environment:
+    name: $ENV_NAME
+  variables:
+    TF_WORKING_DIRECTORY: modules/storage
+  extends: .terraform_destroy
+  dependencies:
+    - s3:plan
+    - s3:apply
+  when: manual
+
+.terraform_validate:
+  extends: .terraform
+  variables:
+    TF_WORKING_DIRECTORY: ''
+  script:
+    - terraform -chdir=$TF_WORKING_DIRECTORY validate
+
+.terraform_plan:
+  extends: .terraform
+  variables:
+    TF_WORKING_DIRECTORY: ''
+  script:
+    - terraform -chdir=$TF_WORKING_DIRECTORY plan -out "planfile"
+  artifacts:
+    paths: 
+      - $TF_WORKING_DIRECTORY/planfile
+
+.terraform_apply:
+  extends: .terraform
+  variables:
+    TF_WORKING_DIRECTORY: ''
+  script:
+    - terraform -chdir=$TF_WORKING_DIRECTORY apply "planfile"
+
+.terraform_destroy:
+  extends: .terraform
+  variables:
+    TF_WORKING_DIRECTORY: ''
+  script:
+    - terraform -chdir=$TF_WORKING_DIRECTORY destroy -auto-approve
